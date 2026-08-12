@@ -1,10 +1,12 @@
 #include <bits/stdc++.h>
+#include <fcntl.h>
+#include <unistd.h>
 using namespace std;
 
 static const char* FILENAME = "storage.dat";
 static const uint32_t MAGIC = 0x46534442; // "FSDB"
 static const uint32_t VERSION = 1;
-static const uint32_t NUM_BUCKETS = 100003;
+static const uint32_t NUM_BUCKETS = 200003;
 
 struct Header {
     uint32_t magic;
@@ -23,7 +25,7 @@ struct Node {
 static_assert(sizeof(Node) == 80, "Node size must be 80");
 static const size_t NODE_SIZE = sizeof(Node);
 
-FILE* g_fp = nullptr;
+int g_fd = -1;
 uint32_t g_num_buckets = 0;
 vector<uint64_t> g_bucket_heads;
 
@@ -42,10 +44,18 @@ static size_t bucket_index(const string& s) {
 
 static void read_header() {
     Header header;
-    fread(&header, sizeof(header), 1, g_fp);
+    ssize_t n = pread(g_fd, &header, sizeof(header), 0);
+    if (n != sizeof(header)) {
+        perror("pread header");
+        exit(1);
+    }
     g_num_buckets = header.num_buckets;
     g_bucket_heads.resize(g_num_buckets);
-    fread(g_bucket_heads.data(), sizeof(uint64_t), g_num_buckets, g_fp);
+    n = pread(g_fd, g_bucket_heads.data(), g_num_buckets * sizeof(uint64_t), sizeof(Header));
+    if (n != static_cast<ssize_t>(g_num_buckets * sizeof(uint64_t))) {
+        perror("pread bucket heads");
+        exit(1);
+    }
 }
 
 static void write_header() {
@@ -53,9 +63,16 @@ static void write_header() {
     header.magic = MAGIC;
     header.version = VERSION;
     header.num_buckets = g_num_buckets;
-    fseek(g_fp, 0, SEEK_SET);
-    fwrite(&header, sizeof(header), 1, g_fp);
-    fwrite(g_bucket_heads.data(), sizeof(uint64_t), g_num_buckets, g_fp);
+    ssize_t n = pwrite(g_fd, &header, sizeof(header), 0);
+    if (n != sizeof(header)) {
+        perror("pwrite header");
+        exit(1);
+    }
+    n = pwrite(g_fd, g_bucket_heads.data(), g_num_buckets * sizeof(uint64_t), sizeof(Header));
+    if (n != static_cast<ssize_t>(g_num_buckets * sizeof(uint64_t))) {
+        perror("pwrite bucket heads");
+        exit(1);
+    }
 }
 
 static void init_file() {
@@ -65,11 +82,11 @@ static void init_file() {
 }
 
 static void open_storage() {
-    g_fp = fopen(FILENAME, "r+b");
-    if (!g_fp) {
-        g_fp = fopen(FILENAME, "w+b");
-        if (!g_fp) {
-            perror("fopen");
+    g_fd = open(FILENAME, O_RDWR);
+    if (g_fd < 0) {
+        g_fd = open(FILENAME, O_RDWR | O_CREAT, 0666);
+        if (g_fd < 0) {
+            perror("open");
             exit(1);
         }
         init_file();
@@ -79,25 +96,33 @@ static void open_storage() {
 }
 
 static void read_node(uint64_t offset, Node& node) {
-    fseek(g_fp, static_cast<long>(offset), SEEK_SET);
-    fread(&node, NODE_SIZE, 1, g_fp);
+    ssize_t n = pread(g_fd, &node, NODE_SIZE, static_cast<off_t>(offset));
+    if (n != static_cast<ssize_t>(NODE_SIZE)) {
+        perror("pread node");
+        exit(1);
+    }
 }
 
 static void write_node(uint64_t offset, const Node& node) {
-    fseek(g_fp, static_cast<long>(offset), SEEK_SET);
-    fwrite(&node, NODE_SIZE, 1, g_fp);
+    ssize_t n = pwrite(g_fd, &node, NODE_SIZE, static_cast<off_t>(offset));
+    if (n != static_cast<ssize_t>(NODE_SIZE)) {
+        perror("pwrite node");
+        exit(1);
+    }
 }
 
 static uint64_t allocate_node_offset() {
-    fseek(g_fp, 0, SEEK_END);
-    return static_cast<uint64_t>(ftell(g_fp));
+    off_t off = lseek(g_fd, 0, SEEK_END);
+    if (off < 0) {
+        perror("lseek");
+        exit(1);
+    }
+    return static_cast<uint64_t>(off);
 }
 
 static void update_bucket_head(size_t idx, uint64_t offset) {
     g_bucket_heads[idx] = offset;
-    uint64_t pos = sizeof(Header) + idx * sizeof(uint64_t);
-    fseek(g_fp, static_cast<long>(pos), SEEK_SET);
-    fwrite(&offset, sizeof(uint64_t), 1, g_fp);
+    // Writes are deferred; write_header() flushes everything at exit.
 }
 
 static bool same_index(const Node& node, const string& index) {
@@ -107,15 +132,6 @@ static bool same_index(const Node& node, const string& index) {
 
 static void do_insert(const string& index, int32_t value) {
     size_t h = bucket_index(index);
-    uint64_t curr = g_bucket_heads[h];
-    Node node;
-    while (curr != 0) {
-        read_node(curr, node);
-        if (same_index(node, index) && node.value == value) {
-            return;
-        }
-        curr = node.next;
-    }
     uint64_t offset = allocate_node_offset();
     Node new_node;
     new_node.next = g_bucket_heads[h];
@@ -200,6 +216,7 @@ int main() {
         }
     }
 
-    fclose(g_fp);
+    write_header();
+    close(g_fd);
     return 0;
 }
